@@ -154,11 +154,13 @@ __device__ void computeCov3D(const glm::vec3 scale, float mod, const glm::vec4 r
 // Perform initial steps for each Gaussian prior to rasterization.
 template<int C>
 __global__ void preprocessCUDA(int P, int D, int M,
+	// const int num_person,
+	const int num_identities, const int* num_points_per_subject, const int* person_cnt_per_subject,
 	const float* orig_points,
 	const glm::vec3* scales,
 	const float scale_modifier,
-	const glm::vec4* rotations,
-	const float* opacities,
+	// const glm::vec4* rotations,
+	// const float* opacities,
 	const float* shs,
 	bool* clamped,
 	const float* cov3D_precomp,
@@ -179,9 +181,34 @@ __global__ void preprocessCUDA(int P, int D, int M,
 	uint32_t* tiles_touched,
 	bool prefiltered)
 {
+	glm::vec4 rotation(1.0f, 0.0f, 0.0f, 0.0f);
+	float opacity = 1.0f;
+	auto total_num_p = 0;
+	for (int identity_idx = 0; identity_idx < num_identities; identity_idx++)
+	{
+		total_num_p += person_cnt_per_subject[identity_idx] * num_points_per_subject[identity_idx];
+	}
+	P = total_num_p;
 	auto idx = cg::this_grid().thread_rank();
 	if (idx >= P)
 		return;
+	int idx_offset = -1;
+	int cur_identity_idx = -1;
+	int cur_points_offset = 0;
+	int next_points_offset = 0;
+	int total_last_num_points = 0;
+	for (int identity_idx = 0; identity_idx < num_identities; identity_idx++)
+	{
+		next_points_offset += num_points_per_subject[identity_idx] * person_cnt_per_subject[identity_idx];
+		if (idx < next_points_offset)
+		{
+			idx_offset = idx - total_last_num_points;
+			cur_identity_idx = identity_idx;
+			break;
+		}
+		cur_points_offset += num_points_per_subject[identity_idx];
+		total_last_num_points = next_points_offset;
+	}
 
 	// Initialize radius and touched tiles to 0. If this isn't changed,
 	// this Gaussian will not be processed further.
@@ -208,7 +235,16 @@ __global__ void preprocessCUDA(int P, int D, int M,
 	}
 	else
 	{
-		computeCov3D(scales[idx], scale_modifier, rotations[idx], cov3Ds + idx * 6);
+		// computeCov3D(scales[idx_offset%num_points_per_subject[cur_identity_idx] + cur_points_offset], scale_modifier, rotations[idx%num_points_per_subject[cur_identity_idx]], cov3Ds + idx * 6);
+		computeCov3D(scales[idx_offset%num_points_per_subject[cur_identity_idx] + cur_points_offset], scale_modifier, rotation, cov3Ds + idx * 6);
+		// if (idx < num_points_per_subject[0] * person_cnt_per_subject[0])
+		// {
+		// 	computeCov3D(scales[idx%num_points_per_subject[0]], scale_modifier, rotations[idx%num_points_per_subject[0]], cov3Ds + idx * 6);
+		// }
+		// else
+		// {
+		// 	computeCov3D(scales[idx%num_points_per_subject[0] + num_points_per_subject[0]], scale_modifier, rotations[idx%num_points_per_subject[0]], cov3Ds + idx * 6);
+		// }
 		cov3D = cov3Ds + idx * 6;
 	}
 
@@ -251,7 +287,8 @@ __global__ void preprocessCUDA(int P, int D, int M,
 	radii[idx] = my_radius;
 	points_xy_image[idx] = point_image;
 	// Inverse 2D covariance and opacity neatly pack into one float4
-	conic_opacity[idx] = { conic.x, conic.y, conic.z, opacities[idx] };
+	// conic_opacity[idx] = { conic.x, conic.y, conic.z, opacities[idx%num_points_per_subject[cur_identity_idx]] };
+	conic_opacity[idx] = { conic.x, conic.y, conic.z, opacity };
 	tiles_touched[idx] = (rect_max.y - rect_min.y) * (rect_max.x - rect_min.x);
 }
 
@@ -264,6 +301,8 @@ renderCUDA(
 	const uint2* __restrict__ ranges,
 	const uint32_t* __restrict__ point_list,
 	int W, int H,
+	int P,
+	int num_identities, const int* num_points_per_subject, const int* person_cnt_per_subject,
 	const float2* __restrict__ points_xy_image,
 	const float* __restrict__ features,
 	const float4* __restrict__ conic_opacity,
@@ -272,6 +311,13 @@ renderCUDA(
 	const float* __restrict__ bg_color,
 	float* __restrict__ out_color)
 {
+	auto total_num_p = 0;
+	for (int identity_idx = 0; identity_idx < num_identities; identity_idx++)
+	{
+		total_num_p += person_cnt_per_subject[identity_idx] * num_points_per_subject[identity_idx];
+	}
+	P = total_num_p;
+
 	// Identify current tile and associated min/max pixel range.
 	auto block = cg::this_thread_block();
 	uint32_t horizontal_blocks = (W + BLOCK_X - 1) / BLOCK_X;
@@ -350,9 +396,38 @@ renderCUDA(
 				continue;
 			}
 
+			int idx_offset = -1;
+			int cur_identity_idx = -1;
+			int cur_points_offset = 0;
+			int next_points_offset = 0;
+			int total_last_num_points = 0;
+			for (int identity_idx = 0; identity_idx < num_identities; identity_idx++)
+			{
+				next_points_offset += num_points_per_subject[identity_idx] * person_cnt_per_subject[identity_idx];
+				if (collected_id[j] < next_points_offset)
+				{
+					idx_offset = collected_id[j] - total_last_num_points;
+					// idx_offset = collected_id[j] - cur_points_offset;
+					cur_identity_idx = identity_idx;
+					break;
+				}
+				cur_points_offset += num_points_per_subject[identity_idx];
+				total_last_num_points = next_points_offset;
+			}
+
 			// Eq. (3) from 3D Gaussian splatting paper.
 			for (int ch = 0; ch < CHANNELS; ch++)
-				C[ch] += features[collected_id[j] * CHANNELS + ch] * alpha * T;
+			{
+				C[ch] += features[(idx_offset%num_points_per_subject[cur_identity_idx] + cur_points_offset) * CHANNELS + ch] * alpha * T;
+				// if (collected_id[j] < (int)(P/num_person) * person1)
+				// {
+				// 	C[ch] += features[(collected_id[j]%((int)(P/num_person))) * CHANNELS + ch] * alpha * T;
+				// }
+				// else
+				// {
+				// 	C[ch] += features[(collected_id[j]%((int)(P/num_person)) + (int)(P/num_person)) * CHANNELS + ch] * alpha * T;
+				// }
+			}
 
 			T = test_T;
 
@@ -378,6 +453,8 @@ void FORWARD::render(
 	const uint2* ranges,
 	const uint32_t* point_list,
 	int W, int H,
+	int P,
+	int num_identities, const int* num_points_per_subject, const int* person_cnt_per_subject,
 	const float2* means2D,
 	const float* colors,
 	const float4* conic_opacity,
@@ -390,6 +467,8 @@ void FORWARD::render(
 		ranges,
 		point_list,
 		W, H,
+		P,
+		num_identities, num_points_per_subject, person_cnt_per_subject,
 		means2D,
 		colors,
 		conic_opacity,
@@ -400,11 +479,13 @@ void FORWARD::render(
 }
 
 void FORWARD::preprocess(int P, int D, int M,
+	// const int num_person,
+	const int num_identities, const int* num_points_per_subject, const int* person_cnt_per_subject,
 	const float* means3D,
 	const glm::vec3* scales,
 	const float scale_modifier,
-	const glm::vec4* rotations,
-	const float* opacities,
+	// const glm::vec4* rotations,
+	// const float* opacities,
 	const float* shs,
 	bool* clamped,
 	const float* cov3D_precomp,
@@ -427,11 +508,13 @@ void FORWARD::preprocess(int P, int D, int M,
 {
 	preprocessCUDA<NUM_CHANNELS> << <(P + 255) / 256, 256 >> > (
 		P, D, M,
+		// num_person,
+		num_identities, num_points_per_subject, person_cnt_per_subject,
 		means3D,
 		scales,
 		scale_modifier,
-		rotations,
-		opacities,
+		// rotations,
+		// opacities,
 		shs,
 		clamped,
 		cov3D_precomp,

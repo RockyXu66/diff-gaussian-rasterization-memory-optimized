@@ -24,6 +24,7 @@
 #include <string>
 #include <functional>
 
+size_t allocdBinning = 0;
 std::function<char*(size_t N)> resizeFunctional(torch::Tensor& t) {
     auto lambda = [&t](size_t N) {
         t.resize_({(long long)N});
@@ -31,15 +32,44 @@ std::function<char*(size_t N)> resizeFunctional(torch::Tensor& t) {
     };
     return lambda;
 }
-
+std::function<char*(size_t N)> resizeFunctional_bin(torch::Tensor& t, size_t& S) {
+    auto lambda = [&t, &S](size_t N) {
+		if (N > S)
+		{
+			// // Free the tensor by assigning it to an empty tensor
+			// t = torch::Tensor();
+			// // Now resize the tensor
+			// t = torch::empty({(long long)(2 * N)}, options.device(device));
+			t.resize_({(long long)(2 * N)});
+			// Return the data pointer
+			std::cout << "bin resize to " << 2 * N << std::endl;
+			S = 2 * N;
+		}
+		// t.resize_({(long long)N});
+        return reinterpret_cast<char*>(t.contiguous().data_ptr());
+    };
+    return lambda;
+}
+torch::Device device(torch::kCUDA);
+torch::TensorOptions options(torch::kByte);
+torch::Tensor geomBuffer = torch::empty({0}, options.device(device));
+torch::Tensor binningBuffer = torch::empty({0}, options.device(device));
+torch::Tensor imgBuffer = torch::empty({0}, options.device(device));
+std::function<char*(size_t)> geomFunc = resizeFunctional(geomBuffer);
+std::function<char*(size_t)> binningFunc = resizeFunctional_bin(binningBuffer, allocdBinning);
+std::function<char*(size_t)> imgFunc = resizeFunctional(imgBuffer);
 std::tuple<int, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor>
 RasterizeGaussiansCUDA(
 	const torch::Tensor& background,
+	// const int num_person,
+	const int num_identities,
+    const torch::Tensor& num_points_per_subject,
+	const torch::Tensor& person_cnt_per_subject,
 	const torch::Tensor& means3D,
     const torch::Tensor& colors,
-    const torch::Tensor& opacity,
+    // const torch::Tensor& opacity,
 	const torch::Tensor& scales,
-	const torch::Tensor& rotations,
+	// const torch::Tensor& rotations,
 	const float scale_modifier,
 	const torch::Tensor& cov3D_precomp,
 	const torch::Tensor& viewmatrix,
@@ -68,14 +98,6 @@ RasterizeGaussiansCUDA(
   torch::Tensor out_color = torch::full({NUM_CHANNELS, H, W}, 0.0, float_opts);
   torch::Tensor radii = torch::full({P}, 0, means3D.options().dtype(torch::kInt32));
   
-  torch::Device device(torch::kCUDA);
-  torch::TensorOptions options(torch::kByte);
-  torch::Tensor geomBuffer = torch::empty({0}, options.device(device));
-  torch::Tensor binningBuffer = torch::empty({0}, options.device(device));
-  torch::Tensor imgBuffer = torch::empty({0}, options.device(device));
-  std::function<char*(size_t)> geomFunc = resizeFunctional(geomBuffer);
-  std::function<char*(size_t)> binningFunc = resizeFunctional(binningBuffer);
-  std::function<char*(size_t)> imgFunc = resizeFunctional(imgBuffer);
   
   int rendered = 0;
   if(P != 0)
@@ -93,13 +115,17 @@ RasterizeGaussiansCUDA(
 	    P, degree, M,
 		background.contiguous().data<float>(),
 		W, H,
+		// num_person,
+		num_identities,
+    	num_points_per_subject.contiguous().data<int>(),
+    	person_cnt_per_subject.contiguous().data<int>(),
 		means3D.contiguous().data<float>(),
 		sh.contiguous().data_ptr<float>(),
 		colors.contiguous().data<float>(), 
-		opacity.contiguous().data<float>(), 
+		// opacity.contiguous().data<float>(), 
 		scales.contiguous().data_ptr<float>(),
 		scale_modifier,
-		rotations.contiguous().data_ptr<float>(),
+		// rotations.contiguous().data_ptr<float>(),
 		cov3D_precomp.contiguous().data<float>(), 
 		viewmatrix.contiguous().data<float>(), 
 		projmatrix.contiguous().data<float>(),
